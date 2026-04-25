@@ -78,3 +78,38 @@ class PlannerApiTests(TestCase):
         self.assertEqual(payload["totals"]["by_section_minutes"]["main"], 120)
         self.assertEqual(payload["totals"]["by_section_minutes"]["learning"], 45)
         self.assertEqual(payload["totals"]["by_section_minutes"]["exercise"], 60)
+
+    def test_week_summaries_happy_path(self):
+        week_start = "2026-04-25"
+        self.client.get(reverse("week-detail", args=[week_start]))
+        update_payload = {
+            "weekly_goal": "Stay consistent",
+            "days": [
+                {
+                    "date": "2026-04-25",
+                    "sections": {
+                        "main": {"duration_minutes": 30, "note": "Kickoff"},
+                        "exercise": {"duration_minutes": 20, "note": "Stretch"},
+                    },
+                }
+            ],
+        }
+        self.client.put(
+            reverse("week-detail", args=[week_start]),
+            data=update_payload,
+            content_type="application/json",
+        )
+
+        response = self.client.get(reverse("week-summaries") + "?span=1")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+
+        self.assertIn("summaries", payload)
+        self.assertGreaterEqual(len(payload["summaries"]), 3)
+
+        target = next(
+            item for item in payload["summaries"] if item["start_date"] == week_start
+        )
+        self.assertEqual(target["weekly_goal"], "Stay consistent")
+        self.assertEqual(target["totals"]["week_total_minutes"], 50)
+        self.assertIn("Saturday: Kickoff", target["notes_by_section"]["main"])

@@ -97,6 +97,32 @@ def serialize_week(week: Week) -> dict:
     }
 
 
+def serialize_week_summary(week: Week) -> dict:
+    days = list(week.days.all().order_by("date"))
+    by_section_notes: dict[str, list[str]] = {section: [] for section in SECTIONS}
+
+    for day in days:
+        for section in SECTIONS:
+            note = getattr(day, f"{section}_note").strip()
+            if not note:
+                continue
+            by_section_notes[section].append(
+                f"{WEEKDAY_NAMES[day.weekday_index]}: {note}"
+            )
+
+    return {
+        "start_date": week.start_date.isoformat(),
+        "end_date": (week.start_date + datetime.timedelta(days=6)).isoformat(),
+        "label": format_week_label(
+            week.start_date, week.start_date + datetime.timedelta(days=6)
+        ),
+        "weekly_goal": week.weekly_goal,
+        "weekly_note": week.weekly_note,
+        "totals": compute_totals(days),
+        "notes_by_section": by_section_notes,
+    }
+
+
 @require_http_methods(["GET"])
 def weeks_list(request):
     today = datetime.date.today()
@@ -127,6 +153,50 @@ def weeks_list(request):
         {
             "current_week_start": current_week_start.isoformat(),
             "weeks": weeks_data,
+        }
+    )
+
+
+@require_http_methods(["GET"])
+def week_summaries(request):
+    today = datetime.date.today()
+    current_week_start = saturday_start(today)
+    span_raw = request.GET.get("span", "8")
+
+    try:
+        span = int(span_raw)
+    except ValueError:
+        return HttpResponseBadRequest("span must be a number")
+
+    span = max(1, min(span, 26))
+    starts = [
+        current_week_start + datetime.timedelta(days=offset * 7)
+        for offset in range(-span, span + 1)
+    ]
+
+    for start in starts:
+        build_week(start)
+
+    weeks_by_start = {
+        week.start_date: week
+        for week in Week.objects.filter(start_date__in=starts).prefetch_related("days")
+    }
+    summaries = []
+    for start in starts:
+        week = weeks_by_start.get(start)
+        if week is None:
+            continue
+        summaries.append(
+            {
+                **serialize_week_summary(week),
+                "is_current": start == current_week_start,
+            }
+        )
+
+    return JsonResponse(
+        {
+            "current_week_start": current_week_start.isoformat(),
+            "summaries": summaries,
         }
     )
 
