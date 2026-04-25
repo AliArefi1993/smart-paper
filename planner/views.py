@@ -133,7 +133,6 @@ def weeks_list(request):
         span = int(span_raw)
     except ValueError:
         return HttpResponseBadRequest("span must be a number")
-
     span = max(1, min(span, 26))
     weeks_data = []
 
@@ -167,7 +166,6 @@ def week_summaries(request):
         span = int(span_raw)
     except ValueError:
         return HttpResponseBadRequest("span must be a number")
-
     span = max(1, min(span, 26))
     starts = [
         current_week_start + datetime.timedelta(days=offset * 7)
