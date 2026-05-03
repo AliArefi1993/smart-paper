@@ -1,0 +1,21 @@
+services:
+  smart-paper:
+    build: .
+    container_name: smart-paper
+    ports:
+      - "8010:8010"
+    volumes:
+      - ./:/app
+    command: sh -c "python manage.py migrate && gunicorn config.wsgi:application --bind 0.0.0.0:8010 --workers 2"
+
+  smart-paper-front:
+    image: node:current
+    container_name: smart-paper-front
+    working_dir: /app
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../smart-paper-front:/app
+    command: sh -c "npm ci && npm run build && npm run start -- -H 0.0.0.0 -p 3000"
+    depends_on:
+      - smart-paper
