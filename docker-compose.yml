@@ -4,9 +4,12 @@ services:
     container_name: smart-paper
     ports:
       - "8010:8010"
+    environment:
+      - FINANCE_PIN=${FINANCE_PIN}
+      - FINANCE_UNLOCK_TTL_SECONDS=${FINANCE_UNLOCK_TTL_SECONDS}
     volumes:
       - ./:/app
-    command: sh -c "python manage.py migrate && gunicorn config.wsgi:application --bind 0.0.0.0:8010 --workers 2"
+    command: sh /app/scripts/start_backend.sh
 
   smart-paper-front:
     image: node:current

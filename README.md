@@ -36,3 +36,19 @@ python manage.py runserver 8010
 - `GET /api/weeks/?span=8` -> list weeks around current week
 - `GET /api/weeks/<saturday-date>/` -> week details and totals
 - `PUT /api/weeks/<saturday-date>/` -> save all day section data for that week
+- `GET /api/finance/` -> finance goal, total income, progress, and entries
+- `PUT /api/finance/` -> update goal and/or add income entry (`goal_amount`, `income_amount`, `income_note`, `income_date`)
+- `POST /api/finance/unlock/` -> unlock finance session (`pin`)
+
+## Finance PIN Setup
+Finance API is protected by a PIN and uses session unlock.
+
+1. Put your PIN in `.env`:
+```bash
+cd /home/aliarefi/Documents/programming/playground/smart-paper
+echo "FINANCE_PIN=1234" >> .env
+```
+2. Start with Docker Compose. Backend hashes it automatically on each startup.
+
+Optional:
+- `FINANCE_UNLOCK_TTL_SECONDS` (default: `3600`, set to `300` in `docker-compose.yml` for 5 minutes)
