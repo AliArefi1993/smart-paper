@@ -100,14 +100,27 @@ def serialize_week(week: Week) -> dict:
 def serialize_week_summary(week: Week) -> dict:
     days = list(week.days.all().order_by("date"))
     by_section_notes: dict[str, list[str]] = {section: [] for section in SECTIONS}
+    details_by_section: dict[str, list[dict]] = {section: [] for section in SECTIONS}
 
     for day in days:
         for section in SECTIONS:
+            duration_minutes = getattr(day, f"{section}_duration_minutes")
+            goal = getattr(day, f"{section}_goal").strip()
             note = getattr(day, f"{section}_note").strip()
-            if not note:
+            if not duration_minutes and not goal and not note:
                 continue
-            by_section_notes[section].append(
-                f"{WEEKDAY_NAMES[day.weekday_index]}: {note}"
+            if note:
+                by_section_notes[section].append(
+                    f"{WEEKDAY_NAMES[day.weekday_index]}: {note}"
+                )
+            details_by_section[section].append(
+                {
+                    "date": day.date.isoformat(),
+                    "weekday_name": WEEKDAY_NAMES[day.weekday_index],
+                    "duration_minutes": duration_minutes,
+                    "goal": goal,
+                    "note": note,
+                }
             )
 
     return {
@@ -120,6 +133,7 @@ def serialize_week_summary(week: Week) -> dict:
         "weekly_note": week.weekly_note,
         "totals": compute_totals(days),
         "notes_by_section": by_section_notes,
+        "details_by_section": details_by_section,
     }
 
 
@@ -133,7 +147,7 @@ def weeks_list(request):
         span = int(span_raw)
     except ValueError:
         return HttpResponseBadRequest("span must be a number")
-    span = max(1, min(span, 26))
+    span = max(1, min(span, 104))
     weeks_data = []
 
     for offset in range(-span, span + 1):
@@ -166,7 +180,7 @@ def week_summaries(request):
         span = int(span_raw)
     except ValueError:
         return HttpResponseBadRequest("span must be a number")
-    span = max(1, min(span, 26))
+    span = max(1, min(span, 104))
     starts = [
         current_week_start + datetime.timedelta(days=offset * 7)
         for offset in range(-span, span + 1)

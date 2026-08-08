@@ -122,6 +122,8 @@ class PlannerApiTests(TestCase):
         self.assertEqual(target["weekly_goal"], "Stay consistent")
         self.assertEqual(target["totals"]["week_total_minutes"], 50)
         self.assertIn("Saturday: Kickoff", target["notes_by_section"]["main"])
+        self.assertEqual(target["details_by_section"]["main"][0]["goal"], "")
+        self.assertEqual(target["details_by_section"]["main"][0]["note"], "Kickoff")
 
     def test_export_all_data_requires_finance_unlock(self):
         response = self.client.get(reverse("export-all-data"))
