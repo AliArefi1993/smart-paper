@@ -58,4 +58,6 @@ echo "FINANCE_UNLOCK_TTL_SECONDS=300" >> .env
 
 Notes:
 - `FINANCE_UNLOCK_TTL_SECONDS` default is `3600` if not set.
+- `FINANCE_UNLOCK_MAX_ATTEMPTS` default is `5` invalid PIN attempts per client address.
+- `FINANCE_UNLOCK_COOLDOWN_SECONDS` default is `300` seconds before PIN retry is allowed.
 - Frontend auto-locks and hides finance data when session expires.

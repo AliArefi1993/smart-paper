@@ -20,3 +20,13 @@ class IncomeEntry(models.Model):
 
     def __str__(self):
         return f"Income {self.amount} on {self.received_on}"
+
+
+class FinanceUnlockAttempt(models.Model):
+    client_key = models.CharField(max_length=64, unique=True)
+    attempts = models.PositiveIntegerField(default=0)
+    locked_until = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Finance unlock attempts: {self.client_key}"

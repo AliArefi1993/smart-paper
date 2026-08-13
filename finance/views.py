@@ -1,18 +1,23 @@
 import datetime
+import hashlib
 import json
 import os
 
 from django.conf import settings
-from django.db.models import Sum
+from django.db import IntegrityError
+from django.db.models import Case, DateTimeField, F, Q, Sum, Value, When
 from django.http import HttpResponseBadRequest, JsonResponse
 from django.contrib.auth.hashers import check_password
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
-from .models import FinanceState, IncomeEntry
+from .models import FinanceState, FinanceUnlockAttempt, IncomeEntry
 
 FINANCE_UNLOCK_SESSION_KEY = "finance_unlocked"
 DEFAULT_UNLOCK_TTL_SECONDS = 3600
+DEFAULT_UNLOCK_MAX_ATTEMPTS = 5
+DEFAULT_UNLOCK_COOLDOWN_SECONDS = 300
 
 
 def finance_pin_hash() -> str:
@@ -33,6 +38,116 @@ def finance_unlock_ttl_seconds() -> int:
     except ValueError:
         return DEFAULT_UNLOCK_TTL_SECONDS
     return max(1, parsed)
+
+
+def finance_unlock_max_attempts() -> int:
+    raw_attempts = getattr(
+        settings,
+        "FINANCE_UNLOCK_MAX_ATTEMPTS",
+        os.environ.get(
+            "FINANCE_UNLOCK_MAX_ATTEMPTS", str(DEFAULT_UNLOCK_MAX_ATTEMPTS)
+        ),
+    )
+    try:
+        parsed = int(raw_attempts)
+    except ValueError:
+        return DEFAULT_UNLOCK_MAX_ATTEMPTS
+    return max(1, parsed)
+
+
+def finance_unlock_cooldown_seconds() -> int:
+    raw_cooldown = getattr(
+        settings,
+        "FINANCE_UNLOCK_COOLDOWN_SECONDS",
+        os.environ.get(
+            "FINANCE_UNLOCK_COOLDOWN_SECONDS", str(DEFAULT_UNLOCK_COOLDOWN_SECONDS)
+        ),
+    )
+    try:
+        parsed = int(raw_cooldown)
+    except ValueError:
+        return DEFAULT_UNLOCK_COOLDOWN_SECONDS
+    return max(1, parsed)
+
+
+def finance_unlock_client_key(request) -> str:
+    client_ip = request.META.get("REMOTE_ADDR", "unknown")
+    return hashlib.sha256(client_ip.encode("utf-8")).hexdigest()
+
+
+def finance_unlock_throttled_response(locked_until, now):
+    retry_after_seconds = max(1, int((locked_until - now).total_seconds()))
+    return JsonResponse(
+        {
+            "detail": "Too many invalid PIN attempts. Try again later.",
+            "retry_after_seconds": retry_after_seconds,
+        },
+        status=429,
+    )
+
+
+def current_finance_unlock_lockout_response(client_key: str):
+    attempt = FinanceUnlockAttempt.objects.filter(client_key=client_key).first()
+    if attempt is None or attempt.locked_until is None:
+        return None
+
+    now = timezone.now()
+    if attempt.locked_until > now:
+        return finance_unlock_throttled_response(attempt.locked_until, now)
+
+    attempt.delete()
+    return None
+
+
+def record_invalid_finance_unlock(client_key: str):
+    max_attempts = finance_unlock_max_attempts()
+    cooldown_seconds = finance_unlock_cooldown_seconds()
+    cooldown_delta = datetime.timedelta(seconds=cooldown_seconds)
+    now = timezone.now()
+
+    try:
+        attempt, _ = (
+            FinanceUnlockAttempt.objects.get_or_create(client_key=client_key)
+        )
+    except IntegrityError:
+        attempt = FinanceUnlockAttempt.objects.get(client_key=client_key)
+
+    if attempt.locked_until and attempt.locked_until > now:
+        return finance_unlock_throttled_response(attempt.locked_until, now)
+
+    stale_attempt_cutoff = now - cooldown_delta
+    FinanceUnlockAttempt.objects.filter(
+        client_key=client_key,
+        locked_until__isnull=True,
+        updated_at__lte=stale_attempt_cutoff,
+    ).update(attempts=0, updated_at=now)
+    FinanceUnlockAttempt.objects.filter(
+        client_key=client_key,
+        locked_until__lte=now,
+    ).update(attempts=0, locked_until=None, updated_at=now)
+
+    locked_until = now + cooldown_delta
+    updated = (
+        FinanceUnlockAttempt.objects.filter(client_key=client_key)
+        .filter(Q(locked_until__isnull=True) | Q(locked_until__lte=now))
+        .update(
+            attempts=F("attempts") + 1,
+            locked_until=Case(
+                When(attempts__gte=max_attempts - 1, then=Value(locked_until)),
+                default=F("locked_until"),
+                output_field=DateTimeField(),
+            ),
+            updated_at=now,
+        )
+    )
+    attempt = FinanceUnlockAttempt.objects.filter(client_key=client_key).first()
+    if not updated and attempt and attempt.locked_until:
+        return finance_unlock_throttled_response(attempt.locked_until, now)
+
+    if attempt and attempt.locked_until and attempt.locked_until > now:
+        return finance_unlock_throttled_response(attempt.locked_until, now)
+
+    return JsonResponse({"detail": "Invalid PIN"}, status=403)
 
 
 def require_finance_unlock(request):
@@ -139,6 +254,11 @@ def finance_unlock(request):
     if not pin_hash:
         return JsonResponse({"detail": "Finance PIN is not configured"}, status=503)
 
+    client_key = finance_unlock_client_key(request)
+    throttled_response = current_finance_unlock_lockout_response(client_key)
+    if throttled_response is not None:
+        return throttled_response
+
     try:
         payload = json.loads(request.body or "{}")
     except json.JSONDecodeError:
@@ -149,7 +269,22 @@ def finance_unlock(request):
         return HttpResponseBadRequest("pin is required")
 
     if not check_password(pin, pin_hash):
-        return JsonResponse({"detail": "Invalid PIN"}, status=403)
+        return record_invalid_finance_unlock(client_key)
+
+    throttled_response = current_finance_unlock_lockout_response(client_key)
+    if throttled_response is not None:
+        return throttled_response
+
+    now = timezone.now()
+    FinanceUnlockAttempt.objects.filter(client_key=client_key).filter(
+        Q(locked_until__isnull=True) | Q(locked_until__lte=now)
+    ).update(attempts=0, locked_until=None, updated_at=now)
+    locked_attempt = FinanceUnlockAttempt.objects.filter(
+        client_key=client_key,
+        locked_until__gt=now,
+    ).first()
+    if locked_attempt is not None:
+        return finance_unlock_throttled_response(locked_attempt.locked_until, now)
 
     request.session[FINANCE_UNLOCK_SESSION_KEY] = True
     ttl_seconds = finance_unlock_ttl_seconds()
