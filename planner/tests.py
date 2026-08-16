@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 
 from finance.models import IncomeEntry
 
-from .models import DayPlan, Week
+from .models import DayPlan, PlannerSectionConfig, Week
 from .views import saturday_start
 
 
@@ -30,8 +30,57 @@ class PlannerApiTests(TestCase):
 
         self.assertEqual(payload["start_date"], week_start)
         self.assertEqual(len(payload["days"]), 7)
+        self.assertEqual(len(payload["planner_sections"]), 10)
+        self.assertEqual(payload["planner_sections"][0]["slot_id"], "slot_1")
+        self.assertEqual(payload["planner_sections"][0]["label"], "Main")
+        self.assertTrue(payload["planner_sections"][0]["active"])
+        self.assertFalse(payload["planner_sections"][-1]["active"])
+        self.assertIn("slot_10", payload["days"][0]["sections"])
         self.assertEqual(Week.objects.count(), 1)
         self.assertEqual(DayPlan.objects.count(), 7)
+        self.assertEqual(PlannerSectionConfig.objects.count(), 10)
+
+    def test_planner_sections_get_put(self):
+        response = self.client.get(reverse("planner-sections"))
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(len(payload["planner_sections"]), 10)
+
+        response = self.client.put(
+            reverse("planner-sections"),
+            data={
+                "planner_sections": [
+                    {"slot_id": "slot_5", "label": "Writing", "active": True},
+                    {"slot_id": "slot_2", "label": "Admin", "active": False},
+                ]
+            },
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        sections_by_slot = {
+            section["slot_id"]: section for section in response.json()["planner_sections"]
+        }
+        self.assertEqual(sections_by_slot["slot_5"]["label"], "Writing")
+        self.assertTrue(sections_by_slot["slot_5"]["active"])
+        self.assertEqual(sections_by_slot["slot_2"]["label"], "Admin")
+        self.assertFalse(sections_by_slot["slot_2"]["active"])
+
+    def test_planner_sections_rejects_deactivating_every_section(self):
+        response = self.client.put(
+            reverse("planner-sections"),
+            data={
+                "planner_sections": [
+                    {"slot_id": "slot_1", "active": False},
+                    {"slot_id": "slot_2", "active": False},
+                    {"slot_id": "slot_3", "active": False},
+                    {"slot_id": "slot_4", "active": False},
+                ]
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(PlannerSectionConfig.objects.get(slot_id="slot_1").active)
 
     def test_week_update_happy_path(self):
         week_start = "2026-04-25"
@@ -81,11 +130,90 @@ class PlannerApiTests(TestCase):
         self.assertEqual(
             payload["weekly_note"], "Keep focus and avoid context switching"
         )
-        self.assertEqual(payload["days"][0]["sections"]["main"]["goal"], "Ship backend")
+        self.assertEqual(payload["days"][0]["sections"]["slot_1"]["goal"], "Ship backend")
         self.assertEqual(payload["totals"]["week_total_minutes"], 225)
-        self.assertEqual(payload["totals"]["by_section_minutes"]["main"], 120)
-        self.assertEqual(payload["totals"]["by_section_minutes"]["learning"], 45)
-        self.assertEqual(payload["totals"]["by_section_minutes"]["exercise"], 60)
+        self.assertEqual(payload["totals"]["by_section_minutes"]["slot_1"], 120)
+        self.assertEqual(payload["totals"]["by_section_minutes"]["slot_3"], 45)
+        self.assertEqual(payload["totals"]["by_section_minutes"]["slot_4"], 60)
+
+    def test_week_update_accepts_slot_ids_and_counts_active_only(self):
+        week_start = "2026-04-25"
+        self.client.get(reverse("week-detail", args=[week_start]))
+
+        response = self.client.put(
+            reverse("week-detail", args=[week_start]),
+            data={
+                "days": [
+                    {
+                        "date": "2026-04-25",
+                        "sections": {
+                            "slot_1": {"duration_minutes": 15, "goal": "Core"},
+                            "slot_5": {
+                                "duration_minutes": 90,
+                                "goal": "Hidden project",
+                                "note": "Keep hidden data",
+                            },
+                        },
+                    }
+                ]
+            },
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["days"][0]["sections"]["slot_5"]["goal"], "Hidden project")
+        self.assertEqual(payload["totals"]["week_total_minutes"], 15)
+        self.assertNotIn("slot_5", payload["totals"]["by_section_minutes"])
+
+        self.client.put(
+            reverse("planner-sections"),
+            data={"planner_sections": [{"slot_id": "slot_5", "active": True}]},
+            content_type="application/json",
+        )
+        response = self.client.get(reverse("week-detail", args=[week_start]))
+        self.assertEqual(response.json()["totals"]["week_total_minutes"], 105)
+        self.assertEqual(response.json()["totals"]["by_section_minutes"]["slot_5"], 90)
+
+    def test_inactive_section_data_is_not_cleared_by_omitted_save(self):
+        week_start = "2026-04-25"
+        self.client.get(reverse("week-detail", args=[week_start]))
+        self.client.put(
+            reverse("week-detail", args=[week_start]),
+            data={
+                "days": [
+                    {
+                        "date": "2026-04-25",
+                        "sections": {
+                            "slot_5": {
+                                "duration_minutes": 50,
+                                "goal": "Private backlog",
+                                "note": "Preserve me",
+                            }
+                        },
+                    }
+                ]
+            },
+            content_type="application/json",
+        )
+
+        response = self.client.put(
+            reverse("week-detail", args=[week_start]),
+            data={
+                "days": [
+                    {
+                        "date": "2026-04-25",
+                        "sections": {"slot_1": {"duration_minutes": 10}},
+                    }
+                ]
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        slot_5 = response.json()["days"][0]["sections"]["slot_5"]
+        self.assertEqual(slot_5["duration_minutes"], 50)
+        self.assertEqual(slot_5["goal"], "Private backlog")
+        self.assertEqual(slot_5["note"], "Preserve me")
 
     def test_week_summaries_happy_path(self):
         week_start = saturday_start(datetime.date.today()).isoformat()
@@ -121,9 +249,10 @@ class PlannerApiTests(TestCase):
         )
         self.assertEqual(target["weekly_goal"], "Stay consistent")
         self.assertEqual(target["totals"]["week_total_minutes"], 50)
-        self.assertIn("Saturday: Kickoff", target["notes_by_section"]["main"])
-        self.assertEqual(target["details_by_section"]["main"][0]["goal"], "")
-        self.assertEqual(target["details_by_section"]["main"][0]["note"], "Kickoff")
+        self.assertIn("planner_sections", target)
+        self.assertIn("Saturday: Kickoff", target["notes_by_section"]["slot_1"])
+        self.assertEqual(target["details_by_section"]["slot_1"][0]["goal"], "")
+        self.assertEqual(target["details_by_section"]["slot_1"][0]["note"], "Kickoff")
 
     def test_export_all_data_requires_finance_unlock(self):
         response = self.client.get(reverse("export-all-data"))
@@ -173,6 +302,8 @@ class PlannerApiTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertIn("planner_sections", payload)
         self.assertIn("exported_at", payload)
         self.assertEqual(payload["weeks"][0]["weekly_goal"], "Exportable week")
         self.assertEqual(payload["weeks"][0]["totals"]["week_total_minutes"], 90)
@@ -362,6 +493,7 @@ class PlannerApiTests(TestCase):
                 reverse("import-all-data") + "?mode=merge",
                 data={
                     "exported_at": "2026-04-30T00:00:00+00:00",
+                    "schema_version": 1,
                     "weeks": [
                         {
                             "start_date": existing_start,
@@ -436,12 +568,27 @@ class PlannerApiTests(TestCase):
                 reverse("import-all-data") + "?mode=replace",
                 data={
                     "exported_at": "2026-04-30T00:00:00+00:00",
+                    "schema_version": 2,
+                    "planner_sections": [
+                        {"slot_id": "slot_5", "label": "Writing", "active": True}
+                    ],
                     "weeks": [
                         {
                             "start_date": "2026-05-02",
                             "weekly_goal": "Only imported week",
                             "weekly_note": "",
-                            "days": [],
+                            "days": [
+                                {
+                                    "date": "2026-05-02",
+                                    "sections": {
+                                        "slot_5": {
+                                            "duration_minutes": 25,
+                                            "goal": "Imported slot",
+                                            "note": "Visible after config",
+                                        }
+                                    },
+                                }
+                            ],
                         }
                     ],
                     "finance": {
@@ -462,5 +609,66 @@ class PlannerApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertFalse(Week.objects.filter(start_date=old_start).exists())
         self.assertTrue(Week.objects.filter(start_date="2026-05-02").exists())
+        section = PlannerSectionConfig.objects.get(slot_id="slot_5")
+        self.assertEqual(section.label, "Writing")
+        self.assertTrue(section.active)
+        imported_week = Week.objects.get(start_date="2026-05-02")
+        self.assertEqual(
+            imported_week.days.get(date="2026-05-02").slot_5_duration_minutes,
+            25,
+        )
         self.assertEqual(IncomeEntry.objects.count(), 1)
         self.assertEqual(IncomeEntry.objects.get().note, "Only imported income")
+
+    def test_import_all_data_accepts_local_mode_section_shape(self):
+        with self.settings(FINANCE_PIN_HASH=make_password("1234")):
+            self.client.post(
+                reverse("finance-unlock"),
+                data={"pin": "1234"},
+                content_type="application/json",
+            )
+            response = self.client.post(
+                reverse("import-all-data") + "?mode=merge",
+                data={
+                    "exported_at": "2026-04-30T00:00:00+00:00",
+                    "schema_version": 2,
+                    "planner_sections": [
+                        {"id": "slot_5", "label": "Writing", "active": True, "order": 5}
+                    ],
+                    "weeks": [],
+                    "finance": {"goal_amount": 0, "entries": []},
+                },
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        section = PlannerSectionConfig.objects.get(slot_id="slot_5")
+        self.assertEqual(section.label, "Writing")
+        self.assertTrue(section.active)
+
+    def test_import_all_data_keeps_at_least_one_planner_section_active(self):
+        with self.settings(FINANCE_PIN_HASH=make_password("1234")):
+            self.client.post(
+                reverse("finance-unlock"),
+                data={"pin": "1234"},
+                content_type="application/json",
+            )
+            response = self.client.post(
+                reverse("import-all-data") + "?mode=merge",
+                data={
+                    "exported_at": "2026-04-30T00:00:00+00:00",
+                    "schema_version": 2,
+                    "planner_sections": [
+                        {"slot_id": "slot_1", "active": False},
+                        {"slot_id": "slot_2", "active": False},
+                        {"slot_id": "slot_3", "active": False},
+                        {"slot_id": "slot_4", "active": False},
+                    ],
+                    "weeks": [],
+                    "finance": {"goal_amount": 0, "entries": []},
+                },
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(PlannerSectionConfig.objects.get(slot_id="slot_1").active)

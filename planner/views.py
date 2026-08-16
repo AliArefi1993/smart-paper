@@ -2,12 +2,56 @@ import datetime
 import json
 
 from django.http import HttpResponseBadRequest, JsonResponse
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
-from .models import DayPlan, Week
+from .models import DayPlan, PlannerSectionConfig, Week
 
-SECTIONS = ("main", "second", "learning", "exercise")
+SLOT_IDS = tuple(f"slot_{index}" for index in range(1, 11))
+LEGACY_SECTION_TO_SLOT = {
+    "main": "slot_1",
+    "second": "slot_2",
+    "learning": "slot_3",
+    "exercise": "slot_4",
+}
+SLOT_TO_FIELD_PREFIX = {
+    "slot_1": "main",
+    "slot_2": "second",
+    "slot_3": "learning",
+    "slot_4": "exercise",
+    **{f"slot_{index}": f"slot_{index}" for index in range(5, 11)},
+}
+SECTION_FIELD_NAMES = [
+    f"{field_prefix}_{field}"
+    for field_prefix in SLOT_TO_FIELD_PREFIX.values()
+    for field in ("duration_minutes", "goal", "note")
+]
+DEFAULT_PLANNER_SECTIONS = tuple(
+    {
+        "slot_id": f"slot_{index}",
+        "label": label,
+        "active": index <= 4,
+        "position": index,
+    }
+    for index, label in enumerate(
+        (
+            "Main",
+            "Second",
+            "Learning",
+            "Exercise",
+            "Section 5",
+            "Section 6",
+            "Section 7",
+            "Section 8",
+            "Section 9",
+            "Section 10",
+        ),
+        start=1,
+    )
+)
+# Backward-compatible alias for older import/export call sites.
+SECTIONS = SLOT_IDS
 WEEKDAY_NAMES = (
     "Saturday",
     "Sunday",
@@ -18,6 +62,58 @@ WEEKDAY_NAMES = (
     "Friday",
 )
 SATURDAY_WEEKDAY = 5
+
+
+def normalize_section_key(section_key: str) -> str | None:
+    if section_key in SLOT_IDS:
+        return section_key
+    return LEGACY_SECTION_TO_SLOT.get(section_key)
+
+
+def field_prefix_for_slot(slot_id: str) -> str:
+    return SLOT_TO_FIELD_PREFIX[slot_id]
+
+
+def ensure_planner_sections() -> list[PlannerSectionConfig]:
+    existing_by_slot = {
+        section.slot_id: section for section in PlannerSectionConfig.objects.all()
+    }
+    to_create = []
+    for default in DEFAULT_PLANNER_SECTIONS:
+        if default["slot_id"] in existing_by_slot:
+            continue
+        to_create.append(PlannerSectionConfig(**default))
+    if to_create:
+        PlannerSectionConfig.objects.bulk_create(to_create)
+    return list(PlannerSectionConfig.objects.filter(slot_id__in=SLOT_IDS))
+
+
+def serialize_planner_section(section: PlannerSectionConfig) -> dict:
+    return {
+        "slot_id": section.slot_id,
+        "label": section.label,
+        "active": section.active,
+        "position": section.position,
+    }
+
+
+def serialize_planner_sections() -> list[dict]:
+    sections_by_slot = {
+        section.slot_id: section for section in ensure_planner_sections()
+    }
+    return [
+        serialize_planner_section(sections_by_slot[slot_id])
+        for slot_id in SLOT_IDS
+        if slot_id in sections_by_slot
+    ]
+
+
+def active_slot_ids(planner_sections: list[dict] | None = None) -> tuple[str, ...]:
+    if planner_sections is None:
+        planner_sections = serialize_planner_sections()
+    return tuple(
+        section["slot_id"] for section in planner_sections if section.get("active")
+    )
 
 
 def saturday_start(given_date: datetime.date) -> datetime.date:
@@ -55,11 +151,12 @@ def build_week(week_start: datetime.date) -> Week:
 
 def serialize_day(day: DayPlan) -> dict:
     sections = {}
-    for section in SECTIONS:
-        sections[section] = {
-            "duration_minutes": getattr(day, f"{section}_duration_minutes"),
-            "goal": getattr(day, f"{section}_goal"),
-            "note": getattr(day, f"{section}_note"),
+    for slot_id in SLOT_IDS:
+        field_prefix = field_prefix_for_slot(slot_id)
+        sections[slot_id] = {
+            "duration_minutes": getattr(day, f"{field_prefix}_duration_minutes"),
+            "goal": getattr(day, f"{field_prefix}_goal"),
+            "note": getattr(day, f"{field_prefix}_note"),
         }
 
     return {
@@ -70,11 +167,14 @@ def serialize_day(day: DayPlan) -> dict:
     }
 
 
-def compute_totals(days: list[DayPlan]) -> dict:
-    by_section = {section: 0 for section in SECTIONS}
+def compute_totals(days: list[DayPlan], section_ids: tuple[str, ...] | None = None) -> dict:
+    if section_ids is None:
+        section_ids = active_slot_ids()
+    by_section = {section: 0 for section in section_ids}
     for day in days:
-        for section in SECTIONS:
-            by_section[section] += getattr(day, f"{section}_duration_minutes")
+        for section in section_ids:
+            field_prefix = field_prefix_for_slot(section)
+            by_section[section] += getattr(day, f"{field_prefix}_duration_minutes")
 
     return {
         "by_section_minutes": by_section,
@@ -84,6 +184,7 @@ def compute_totals(days: list[DayPlan]) -> dict:
 
 def serialize_week(week: Week) -> dict:
     days = list(week.days.all().order_by("date"))
+    planner_sections = serialize_planner_sections()
     return {
         "start_date": week.start_date.isoformat(),
         "end_date": (week.start_date + datetime.timedelta(days=6)).isoformat(),
@@ -92,21 +193,25 @@ def serialize_week(week: Week) -> dict:
         ),
         "weekly_goal": week.weekly_goal,
         "weekly_note": week.weekly_note,
+        "planner_sections": planner_sections,
         "days": [serialize_day(day) for day in days],
-        "totals": compute_totals(days),
+        "totals": compute_totals(days, active_slot_ids(planner_sections)),
     }
 
 
 def serialize_week_summary(week: Week) -> dict:
     days = list(week.days.all().order_by("date"))
-    by_section_notes: dict[str, list[str]] = {section: [] for section in SECTIONS}
-    details_by_section: dict[str, list[dict]] = {section: [] for section in SECTIONS}
+    planner_sections = serialize_planner_sections()
+    section_ids = active_slot_ids(planner_sections)
+    by_section_notes: dict[str, list[str]] = {section: [] for section in section_ids}
+    details_by_section: dict[str, list[dict]] = {section: [] for section in section_ids}
 
     for day in days:
-        for section in SECTIONS:
-            duration_minutes = getattr(day, f"{section}_duration_minutes")
-            goal = getattr(day, f"{section}_goal").strip()
-            note = getattr(day, f"{section}_note").strip()
+        for section in section_ids:
+            field_prefix = field_prefix_for_slot(section)
+            duration_minutes = getattr(day, f"{field_prefix}_duration_minutes")
+            goal = getattr(day, f"{field_prefix}_goal").strip()
+            note = getattr(day, f"{field_prefix}_note").strip()
             if not duration_minutes and not goal and not note:
                 continue
             if note:
@@ -131,10 +236,73 @@ def serialize_week_summary(week: Week) -> dict:
         ),
         "weekly_goal": week.weekly_goal,
         "weekly_note": week.weekly_note,
-        "totals": compute_totals(days),
+        "planner_sections": planner_sections,
+        "totals": compute_totals(days, section_ids),
         "notes_by_section": by_section_notes,
         "details_by_section": details_by_section,
     }
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PUT"])
+def planner_sections(request):
+    if request.method == "GET":
+        return JsonResponse({"planner_sections": serialize_planner_sections()})
+
+    try:
+        payload = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return HttpResponseBadRequest("Invalid JSON payload")
+
+    sections_payload = payload.get("planner_sections")
+    if not isinstance(sections_payload, list):
+        return HttpResponseBadRequest("planner_sections must be an array")
+
+    sections_by_slot = {section.slot_id: section for section in ensure_planner_sections()}
+    changed = []
+    now = timezone.now()
+    for item in sections_payload:
+        if not isinstance(item, dict):
+            continue
+        slot_id = item.get("slot_id")
+        if slot_id not in SLOT_IDS:
+            return HttpResponseBadRequest("planner_sections contains an invalid slot_id")
+        section = sections_by_slot[slot_id]
+        did_change = False
+
+        label = item.get("label")
+        if label is not None:
+            if not isinstance(label, str):
+                return HttpResponseBadRequest("planner section label must be text")
+            section.label = label.strip() or next(
+                default["label"]
+                for default in DEFAULT_PLANNER_SECTIONS
+                if default["slot_id"] == slot_id
+            )
+            did_change = True
+
+        active = item.get("active")
+        if active is not None:
+            if not isinstance(active, bool):
+                return HttpResponseBadRequest("planner section active must be boolean")
+            section.active = active
+            did_change = True
+
+        if did_change:
+            section.updated_at = now
+            changed.append(section)
+
+    if changed:
+        next_active_by_slot = {
+            slot_id: section.active for slot_id, section in sections_by_slot.items()
+        }
+        for section in changed:
+            next_active_by_slot[section.slot_id] = section.active
+        if not any(next_active_by_slot.values()):
+            return HttpResponseBadRequest("at least one planner section must be active")
+        PlannerSectionConfig.objects.bulk_update(changed, ["label", "active", "updated_at"])
+
+    return JsonResponse({"planner_sections": serialize_planner_sections()})
 
 
 @require_http_methods(["GET"])
@@ -262,42 +430,34 @@ def week_detail(request, start_date: str):
             if not isinstance(sections, dict):
                 continue
 
-            for section in SECTIONS:
-                section_payload = sections.get(section, {})
+            changed = False
+            for raw_section, section_payload in sections.items():
+                section = normalize_section_key(raw_section)
+                if section is None:
+                    continue
                 if not isinstance(section_payload, dict):
                     continue
+                field_prefix = field_prefix_for_slot(section)
 
                 duration = section_payload.get("duration_minutes")
                 goal = section_payload.get("goal")
                 note = section_payload.get("note")
 
                 if isinstance(duration, int) and duration >= 0:
-                    setattr(day, f"{section}_duration_minutes", duration)
+                    setattr(day, f"{field_prefix}_duration_minutes", duration)
+                    changed = True
                 if isinstance(goal, str):
-                    setattr(day, f"{section}_goal", goal.strip())
+                    setattr(day, f"{field_prefix}_goal", goal.strip())
+                    changed = True
                 if isinstance(note, str):
-                    setattr(day, f"{section}_note", note.strip())
+                    setattr(day, f"{field_prefix}_note", note.strip())
+                    changed = True
 
-            changed_days.append(day)
+            if changed:
+                changed_days.append(day)
 
         if changed_days:
-            DayPlan.objects.bulk_update(
-                changed_days,
-                [
-                    "main_duration_minutes",
-                    "main_goal",
-                    "main_note",
-                    "second_duration_minutes",
-                    "second_goal",
-                    "second_note",
-                    "learning_duration_minutes",
-                    "learning_goal",
-                    "learning_note",
-                    "exercise_duration_minutes",
-                    "exercise_goal",
-                    "exercise_note",
-                ],
-            )
+            DayPlan.objects.bulk_update(changed_days, SECTION_FIELD_NAMES)
 
     week.refresh_from_db()
     return JsonResponse(serialize_week(week))

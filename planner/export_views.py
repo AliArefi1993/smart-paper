@@ -5,6 +5,7 @@ import json
 
 from django.db import transaction
 from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from openpyxl import Workbook
@@ -14,8 +15,20 @@ from openpyxl.utils import get_column_letter
 from finance.models import FinanceState, IncomeEntry
 from finance.views import require_finance_unlock, serialize_finance
 
-from .models import DayPlan, Week
-from .views import SECTIONS, WEEKDAY_NAMES, build_week, serialize_week
+from .models import DayPlan, PlannerSectionConfig, Week
+from .views import (
+    SECTION_FIELD_NAMES,
+    SECTIONS,
+    SLOT_IDS,
+    WEEKDAY_NAMES,
+    build_week,
+    field_prefix_for_slot,
+    normalize_section_key,
+    serialize_planner_sections,
+    serialize_week,
+)
+
+SCHEMA_VERSION = 2
 
 
 EXPORT_COLUMNS = [
@@ -25,6 +38,7 @@ EXPORT_COLUMNS = [
     "date",
     "weekday",
     "section",
+    "section_label",
     "duration_minutes",
     "goal",
     "note",
@@ -37,21 +51,47 @@ EXPORT_COLUMNS = [
 
 
 def export_payload() -> dict:
+    planner_sections = serialize_planner_sections()
     weeks = [
         serialize_week(week)
         for week in Week.objects.all().order_by("start_date").prefetch_related("days")
     ]
     return {
+        "schema_version": SCHEMA_VERSION,
         "exported_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "planner_sections": planner_sections,
         "weeks": weeks,
         "finance": serialize_finance(),
     }
+
+
+def section_label_lookup(payload: dict) -> dict[str, str]:
+    return {
+        section["slot_id"]: section["label"]
+        for section in payload.get("planner_sections", [])
+        if isinstance(section, dict)
+        and section.get("slot_id") in SLOT_IDS
+        and isinstance(section.get("label"), str)
+    }
+
+
+def readable_section_ids(payload: dict) -> tuple[str, ...]:
+    active_sections = [
+        section.get("slot_id")
+        for section in payload.get("planner_sections", [])
+        if isinstance(section, dict)
+        and section.get("slot_id") in SLOT_IDS
+        and section.get("active")
+    ]
+    return tuple(active_sections) or SECTIONS[:4]
 
 
 def export_csv(payload: dict) -> str:
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=EXPORT_COLUMNS)
     writer.writeheader()
+    section_labels = section_label_lookup(payload)
+    section_ids = readable_section_ids(payload)
 
     for week in payload["weeks"]:
         writer.writerow(
@@ -64,8 +104,10 @@ def export_csv(payload: dict) -> str:
             }
         )
         for day in week["days"]:
-            for section in SECTIONS:
-                section_data = day["sections"][section]
+            for section in section_ids:
+                section_data = day["sections"].get(section)
+                if section_data is None:
+                    continue
                 writer.writerow(
                     {
                         "record_type": "day_section",
@@ -74,6 +116,7 @@ def export_csv(payload: dict) -> str:
                         "date": day["date"],
                         "weekday": WEEKDAY_NAMES[day["weekday_index"]],
                         "section": section,
+                        "section_label": section_labels.get(section, section),
                         "duration_minutes": section_data["duration_minutes"],
                         "goal": section_data["goal"],
                         "note": section_data["note"],
@@ -104,6 +147,8 @@ def export_csv(payload: dict) -> str:
 
 
 def export_markdown(payload: dict) -> str:
+    section_labels = section_label_lookup(payload)
+    section_ids = readable_section_ids(payload)
     lines = [
         "# Smart Paper Export",
         "",
@@ -148,16 +193,19 @@ def export_markdown(payload: dict) -> str:
 
         for day in week["days"]:
             day_lines = []
-            for section in SECTIONS:
-                section_data = day["sections"][section]
+            for section in section_ids:
+                section_data = day["sections"].get(section)
+                if section_data is None:
+                    continue
                 if (
                     section_data["duration_minutes"] == 0
                     and not section_data["goal"]
                     and not section_data["note"]
                 ):
                     continue
+                section_label = section_labels.get(section, section)
                 day_lines.append(
-                    f"  - {section}: {section_data['duration_minutes']} min; goal: {section_data['goal'] or 'none'}; note: {section_data['note'] or 'none'}"
+                    f"  - {section} ({section_label}): {section_data['duration_minutes']} min; goal: {section_data['goal'] or 'none'}; note: {section_data['note'] or 'none'}"
                 )
             if not day_lines:
                 continue
@@ -183,6 +231,8 @@ def style_sheet(sheet) -> None:
 
 
 def export_xlsx(payload: dict) -> bytes:
+    section_labels = section_label_lookup(payload)
+    section_ids = readable_section_ids(payload)
     workbook = Workbook()
     overview = workbook.active
     overview.title = "Overview"
@@ -195,16 +245,17 @@ def export_xlsx(payload: dict) -> bytes:
     overview.append(["Progress percent", payload["finance"]["progress_percent"]])
 
     weeks_sheet = workbook.create_sheet("Weeks")
+    section_columns = [
+        f"{section_labels.get(slot_id, slot_id)} ({slot_id}) minutes"
+        for slot_id in section_ids
+    ]
     weeks_sheet.append(
         [
             "Week start",
             "Week end",
             "Weekly goal",
             "Weekly note",
-            "Main minutes",
-            "Second minutes",
-            "Learning minutes",
-            "Exercise minutes",
+            *section_columns,
             "Total minutes",
         ]
     )
@@ -229,22 +280,21 @@ def export_xlsx(payload: dict) -> bytes:
                 week["end_date"],
                 week["weekly_goal"],
                 week["weekly_note"],
-                totals["main"],
-                totals["second"],
-                totals["learning"],
-                totals["exercise"],
+                *[totals.get(slot_id, 0) for slot_id in section_ids],
                 week["totals"]["week_total_minutes"],
             ]
         )
         for day in week["days"]:
-            for section in SECTIONS:
-                section_data = day["sections"][section]
+            for section in section_ids:
+                section_data = day["sections"].get(section)
+                if section_data is None:
+                    continue
                 day_sheet.append(
                     [
                         week["start_date"],
                         day["date"],
                         day["weekday_name"],
-                        section,
+                        f"{section} ({section_labels.get(section, section)})",
                         section_data["duration_minutes"],
                         section_data["goal"],
                         section_data["note"],
@@ -299,41 +349,74 @@ def import_week(week_data: dict) -> bool:
         if not isinstance(sections, dict):
             continue
 
-        for section in SECTIONS:
-            section_data = sections.get(section, {})
+        for raw_section, section_data in sections.items():
+            section = normalize_section_key(raw_section)
+            if section is None:
+                continue
             if not isinstance(section_data, dict):
                 continue
+            field_prefix = field_prefix_for_slot(section)
             duration = section_data.get("duration_minutes")
             goal = section_data.get("goal")
             note = section_data.get("note")
             if isinstance(duration, int) and duration >= 0:
-                setattr(day, f"{section}_duration_minutes", duration)
+                setattr(day, f"{field_prefix}_duration_minutes", duration)
             if isinstance(goal, str):
-                setattr(day, f"{section}_goal", goal.strip())
+                setattr(day, f"{field_prefix}_goal", goal.strip())
             if isinstance(note, str):
-                setattr(day, f"{section}_note", note.strip())
+                setattr(day, f"{field_prefix}_note", note.strip())
         changed_days.append(day)
 
     if changed_days:
-        DayPlan.objects.bulk_update(
-            changed_days,
-            [
-                "main_duration_minutes",
-                "main_goal",
-                "main_note",
-                "second_duration_minutes",
-                "second_goal",
-                "second_note",
-                "learning_duration_minutes",
-                "learning_goal",
-                "learning_note",
-                "exercise_duration_minutes",
-                "exercise_goal",
-                "exercise_note",
-            ],
-        )
+        DayPlan.objects.bulk_update(changed_days, SECTION_FIELD_NAMES)
 
     return True
+
+
+def import_planner_sections(sections_data) -> int:
+    if not isinstance(sections_data, list):
+        return 0
+
+    existing_by_slot = {
+        section.slot_id: section
+        for section in PlannerSectionConfig.objects.filter(slot_id__in=SLOT_IDS)
+    }
+    changed = []
+    now = timezone.now()
+    for item in sections_data:
+        if not isinstance(item, dict):
+            continue
+        slot_id = item.get("slot_id") or item.get("id")
+        if slot_id not in SLOT_IDS or slot_id not in existing_by_slot:
+            continue
+        section = existing_by_slot[slot_id]
+        did_change = False
+        label = item.get("label")
+        if isinstance(label, str):
+            section.label = label.strip() or section.label
+            did_change = True
+        active = item.get("active")
+        if isinstance(active, bool):
+            section.active = active
+            did_change = True
+        if did_change:
+            section.updated_at = now
+            changed.append(section)
+
+    if changed:
+        next_active_by_slot = {
+            slot_id: section.active for slot_id, section in existing_by_slot.items()
+        }
+        for section in changed:
+            next_active_by_slot[section.slot_id] = section.active
+        if not any(next_active_by_slot.values()):
+            first_section = existing_by_slot[SLOT_IDS[0]]
+            first_section.active = True
+            first_section.updated_at = now
+            if first_section not in changed:
+                changed.append(first_section)
+        PlannerSectionConfig.objects.bulk_update(changed, ["label", "active", "updated_at"])
+    return len(changed)
 
 
 def import_finance(finance_data: dict) -> tuple[bool, int]:
@@ -382,8 +465,14 @@ def import_payload(payload: dict, mode: str) -> dict:
         if mode == "replace":
             DayPlan.objects.all().delete()
             Week.objects.all().delete()
+            PlannerSectionConfig.objects.all().delete()
             IncomeEntry.objects.all().delete()
             FinanceState.objects.all().delete()
+
+        serialize_planner_sections()
+        planner_sections_imported = import_planner_sections(
+            payload.get("planner_sections")
+        )
 
         imported_weeks = 0
         for week_data in payload["weeks"]:
@@ -397,6 +486,7 @@ def import_payload(payload: dict, mode: str) -> dict:
     return {
         "mode": mode,
         "weeks_imported": imported_weeks,
+        "planner_sections_imported": planner_sections_imported,
         "income_entries_imported": imported_entries,
         "finance_goal_updated": updated_goal,
         "payload": export_payload(),
