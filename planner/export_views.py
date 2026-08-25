@@ -15,7 +15,7 @@ from openpyxl.utils import get_column_letter
 from finance.models import FinanceState, IncomeEntry
 from finance.views import require_finance_unlock, serialize_finance
 
-from .models import DayPlan, PlannerSectionConfig, Week
+from .models import DayPlan, DayScheduleEntry, PlannerSectionConfig, Week
 from .views import (
     SECTION_FIELD_NAMES,
     SECTIONS,
@@ -23,12 +23,13 @@ from .views import (
     WEEKDAY_NAMES,
     build_week,
     field_prefix_for_slot,
+    normalize_schedule_entry_payload,
     normalize_section_key,
     serialize_planner_sections,
     serialize_week,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 EXPORT_COLUMNS = [
@@ -39,6 +40,9 @@ EXPORT_COLUMNS = [
     "weekday",
     "section",
     "section_label",
+    "start_time",
+    "end_time",
+    "title",
     "duration_minutes",
     "goal",
     "note",
@@ -54,7 +58,9 @@ def export_payload() -> dict:
     planner_sections = serialize_planner_sections()
     weeks = [
         serialize_week(week)
-        for week in Week.objects.all().order_by("start_date").prefetch_related("days")
+        for week in Week.objects.all()
+        .order_by("start_date")
+        .prefetch_related("days__schedule_entries")
     ]
     return {
         "schema_version": SCHEMA_VERSION,
@@ -104,6 +110,24 @@ def export_csv(payload: dict) -> str:
             }
         )
         for day in week["days"]:
+            for entry in day.get("schedule_entries", []):
+                writer.writerow(
+                    {
+                        "record_type": "schedule_entry",
+                        "week_start": week["start_date"],
+                        "week_end": week["end_date"],
+                        "date": day["date"],
+                        "weekday": WEEKDAY_NAMES[day["weekday_index"]],
+                        "section": entry.get("section_id") or "",
+                        "section_label": section_labels.get(
+                            entry.get("section_id") or "", ""
+                        ),
+                        "start_time": entry["start_time"],
+                        "end_time": entry["end_time"],
+                        "title": entry["title"],
+                        "note": entry.get("note", ""),
+                    }
+                )
             for section in section_ids:
                 section_data = day["sections"].get(section)
                 if section_data is None:
@@ -193,6 +217,13 @@ def export_markdown(payload: dict) -> str:
 
         for day in week["days"]:
             day_lines = []
+            for entry in day.get("schedule_entries", []):
+                section_label = section_labels.get(entry.get("section_id") or "", "")
+                suffix = f"; section: {section_label}" if section_label else ""
+                note = f"; note: {entry['note']}" if entry.get("note") else ""
+                day_lines.append(
+                    f"  - Schedule {entry['start_time']}-{entry['end_time']}: {entry['title']}{suffix}{note}"
+                )
             for section in section_ids:
                 section_data = day["sections"].get(section)
                 if section_data is None:
@@ -271,6 +302,19 @@ def export_xlsx(payload: dict) -> bytes:
             "Note",
         ]
     )
+    schedule_sheet = workbook.create_sheet("Schedule")
+    schedule_sheet.append(
+        [
+            "Week start",
+            "Date",
+            "Weekday",
+            "Start time",
+            "End time",
+            "Title",
+            "Section",
+            "Note",
+        ]
+    )
 
     for week in payload["weeks"]:
         totals = week["totals"]["by_section_minutes"]
@@ -285,6 +329,20 @@ def export_xlsx(payload: dict) -> bytes:
             ]
         )
         for day in week["days"]:
+            for entry in day.get("schedule_entries", []):
+                section_id = entry.get("section_id") or ""
+                schedule_sheet.append(
+                    [
+                        week["start_date"],
+                        day["date"],
+                        day["weekday_name"],
+                        entry["start_time"],
+                        entry["end_time"],
+                        entry["title"],
+                        section_labels.get(section_id, section_id),
+                        entry.get("note", ""),
+                    ]
+                )
             for section in section_ids:
                 section_data = day["sections"].get(section)
                 if section_data is None:
@@ -366,6 +424,26 @@ def import_week(week_data: dict) -> bool:
             if isinstance(note, str):
                 setattr(day, f"{field_prefix}_note", note.strip())
         changed_days.append(day)
+
+        if "schedule_entries" in day_data:
+            entries_data = day_data["schedule_entries"]
+            if not isinstance(entries_data, list):
+                raise ValueError("schedule_entries must be an array")
+            normalized_entries = [
+                normalize_schedule_entry_payload(entry, index)
+                for index, entry in enumerate(entries_data)
+            ]
+            if len({entry["id"] for entry in normalized_entries}) != len(
+                normalized_entries
+            ):
+                raise ValueError("schedule entry ids must be unique")
+            day.schedule_entries.all().delete()
+            DayScheduleEntry.objects.bulk_create(
+                [
+                    DayScheduleEntry(day=day, **entry)
+                    for entry in normalized_entries
+                ]
+            )
 
     if changed_days:
         DayPlan.objects.bulk_update(changed_days, SECTION_FIELD_NAMES)

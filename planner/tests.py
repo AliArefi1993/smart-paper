@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 
 from finance.models import IncomeEntry
 
-from .models import DayPlan, PlannerSectionConfig, Week
+from .models import DayPlan, DayScheduleEntry, PlannerSectionConfig, Week
 from .views import saturday_start
 
 
@@ -36,6 +36,7 @@ class PlannerApiTests(TestCase):
         self.assertTrue(payload["planner_sections"][0]["active"])
         self.assertFalse(payload["planner_sections"][-1]["active"])
         self.assertIn("slot_10", payload["days"][0]["sections"])
+        self.assertEqual(payload["days"][0]["schedule_entries"], [])
         self.assertEqual(Week.objects.count(), 1)
         self.assertEqual(DayPlan.objects.count(), 7)
         self.assertEqual(PlannerSectionConfig.objects.count(), 10)
@@ -135,6 +136,97 @@ class PlannerApiTests(TestCase):
         self.assertEqual(payload["totals"]["by_section_minutes"]["slot_1"], 120)
         self.assertEqual(payload["totals"]["by_section_minutes"]["slot_3"], 45)
         self.assertEqual(payload["totals"]["by_section_minutes"]["slot_4"], 60)
+
+    def test_week_update_saves_sorts_and_replaces_schedule_entries(self):
+        week_start = "2026-04-25"
+        self.client.get(reverse("week-detail", args=[week_start]))
+
+        response = self.client.put(
+            reverse("week-detail", args=[week_start]),
+            data={
+                "days": [
+                    {
+                        "date": "2026-04-25",
+                        "schedule_entries": [
+                            {
+                                "start_time": "18:00",
+                                "end_time": "19:00",
+                                "title": "Meeting",
+                                "note": "Discuss launch",
+                                "section_id": "slot_1",
+                            },
+                            {
+                                "start_time": "08:30",
+                                "end_time": "09:00",
+                                "title": "Plan day",
+                            },
+                        ],
+                    }
+                ]
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        entries = response.json()["days"][0]["schedule_entries"]
+        self.assertEqual([entry["title"] for entry in entries], ["Plan day", "Meeting"])
+        self.assertEqual(entries[1]["start_time"], "18:00")
+        self.assertEqual(entries[1]["section_id"], "slot_1")
+        self.assertEqual(DayScheduleEntry.objects.count(), 2)
+
+        response = self.client.put(
+            reverse("week-detail", args=[week_start]),
+            data={
+                "days": [
+                    {
+                        "date": "2026-04-25",
+                        "schedule_entries": [
+                            {
+                                "id": entries[0]["id"],
+                                "start_time": "10:00",
+                                "end_time": "11:00",
+                                "title": "Updated plan",
+                                "note": "",
+                                "section_id": None,
+                            }
+                        ],
+                    }
+                ]
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        entries = response.json()["days"][0]["schedule_entries"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["title"], "Updated plan")
+        self.assertEqual(DayScheduleEntry.objects.count(), 1)
+
+    def test_week_update_rejects_invalid_schedule_entry_time(self):
+        week_start = "2026-04-25"
+        self.client.get(reverse("week-detail", args=[week_start]))
+
+        response = self.client.put(
+            reverse("week-detail", args=[week_start]),
+            data={
+                "days": [
+                    {
+                        "date": "2026-04-25",
+                        "schedule_entries": [
+                            {
+                                "start_time": "19:00",
+                                "end_time": "18:00",
+                                "title": "Backwards",
+                            }
+                        ],
+                    }
+                ]
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(DayScheduleEntry.objects.count(), 0)
 
     def test_week_update_accepts_slot_ids_and_counts_active_only(self):
         week_start = "2026-04-25"
@@ -302,7 +394,7 @@ class PlannerApiTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["schema_version"], 3)
         self.assertIn("planner_sections", payload)
         self.assertIn("exported_at", payload)
         self.assertEqual(payload["weeks"][0]["weekly_goal"], "Exportable week")
@@ -359,6 +451,43 @@ class PlannerApiTests(TestCase):
         self.assertIn("income,", content)
         self.assertIn("CSV income", content)
 
+    def test_export_all_data_includes_schedule_entries(self):
+        week_start = "2026-04-25"
+        self.client.get(reverse("week-detail", args=[week_start]))
+        self.client.put(
+            reverse("week-detail", args=[week_start]),
+            data={
+                "days": [
+                    {
+                        "date": "2026-04-25",
+                        "schedule_entries": [
+                            {
+                                "start_time": "18:00",
+                                "end_time": "19:00",
+                                "title": "Release meeting",
+                                "note": "Bring notes",
+                                "section_id": "slot_1",
+                            }
+                        ],
+                    }
+                ],
+            },
+            content_type="application/json",
+        )
+
+        with self.settings(FINANCE_PIN_HASH=make_password("1234")):
+            self.client.post(
+                reverse("finance-unlock"),
+                data={"pin": "1234"},
+                content_type="application/json",
+            )
+            response = self.client.get(reverse("export-all-data"))
+
+        self.assertEqual(response.status_code, 200)
+        entry = response.json()["weeks"][0]["days"][0]["schedule_entries"][0]
+        self.assertEqual(entry["title"], "Release meeting")
+        self.assertEqual(entry["start_time"], "18:00")
+
     def test_export_all_data_xlsx_happy_path(self):
         week_start = "2026-04-25"
         self.client.get(reverse("week-detail", args=[week_start]))
@@ -403,7 +532,7 @@ class PlannerApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         workbook = load_workbook(io.BytesIO(response.content))
         self.assertEqual(
-            workbook.sheetnames, ["Overview", "Weeks", "Day Sections", "Income"]
+            workbook.sheetnames, ["Overview", "Weeks", "Day Sections", "Schedule", "Income"]
         )
         self.assertEqual(workbook["Weeks"]["C2"].value, "Readable Excel week")
         self.assertEqual(workbook["Day Sections"]["E2"].value, 55)
@@ -543,6 +672,73 @@ class PlannerApiTests(TestCase):
         self.assertEqual(IncomeEntry.objects.count(), 2)
         self.assertEqual(IncomeEntry.objects.get(id=existing_income_id).amount, 450)
         self.assertTrue(IncomeEntry.objects.filter(id=98765).exists())
+
+    def test_import_all_data_replaces_schedule_entries_for_imported_day(self):
+        week_start = "2026-04-25"
+        self.client.get(reverse("week-detail", args=[week_start]))
+        self.client.put(
+            reverse("week-detail", args=[week_start]),
+            data={
+                "days": [
+                    {
+                        "date": week_start,
+                        "schedule_entries": [
+                            {
+                                "start_time": "08:00",
+                                "end_time": "09:00",
+                                "title": "Old schedule",
+                            }
+                        ],
+                    }
+                ],
+            },
+            content_type="application/json",
+        )
+
+        with self.settings(FINANCE_PIN_HASH=make_password("1234")):
+            self.client.post(
+                reverse("finance-unlock"),
+                data={"pin": "1234"},
+                content_type="application/json",
+            )
+            response = self.client.post(
+                reverse("import-all-data") + "?mode=merge",
+                data={
+                    "exported_at": "2026-04-30T00:00:00+00:00",
+                    "schema_version": 3,
+                    "weeks": [
+                        {
+                            "start_date": week_start,
+                            "weekly_goal": "",
+                            "weekly_note": "",
+                            "days": [
+                                {
+                                    "date": week_start,
+                                    "sections": {},
+                                    "schedule_entries": [
+                                        {
+                                            "start_time": "18:00",
+                                            "end_time": "19:00",
+                                            "title": "Imported meeting",
+                                            "note": "New schedule",
+                                            "section_id": "slot_2",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                    "finance": {"goal_amount": 0, "entries": []},
+                },
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        day = Week.objects.get(start_date=week_start).days.get(date=week_start)
+        entries = list(day.schedule_entries.all())
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].title, "Imported meeting")
+        self.assertEqual(entries[0].start_minutes, 18 * 60)
 
     def test_import_all_data_replace_deletes_old_data_first(self):
         old_start = "2026-04-25"

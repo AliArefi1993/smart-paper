@@ -1,12 +1,14 @@
 import datetime
 import json
+import uuid
 
+from django.db import transaction
 from django.http import HttpResponseBadRequest, JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
-from .models import DayPlan, PlannerSectionConfig, Week
+from .models import DayPlan, DayScheduleEntry, PlannerSectionConfig, Week
 
 SLOT_IDS = tuple(f"slot_{index}" for index in range(1, 11))
 LEGACY_SECTION_TO_SLOT = {
@@ -62,6 +64,7 @@ WEEKDAY_NAMES = (
     "Friday",
 )
 SATURDAY_WEEKDAY = 5
+MAX_SCHEDULE_TITLE_LENGTH = 160
 
 
 def normalize_section_key(section_key: str) -> str | None:
@@ -126,6 +129,86 @@ def format_week_label(start_date: datetime.date, end_date: datetime.date) -> str
     return f"{start_date.isoformat()} to {end_date.isoformat()}"
 
 
+def format_minutes(minutes: int) -> str:
+    hours, remaining_minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{remaining_minutes:02d}"
+
+
+def parse_time_minutes(value, field_name: str) -> int:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be HH:MM")
+    try:
+        parsed_time = datetime.time.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be HH:MM") from exc
+    if parsed_time.second or parsed_time.microsecond:
+        raise ValueError(f"{field_name} must be HH:MM")
+    return parsed_time.hour * 60 + parsed_time.minute
+
+
+def normalize_schedule_entry_payload(item: dict, index: int) -> dict:
+    if not isinstance(item, dict):
+        raise ValueError("schedule_entries must contain objects")
+
+    raw_id = item.get("id")
+    entry_id = uuid.uuid4()
+    if raw_id:
+        if not isinstance(raw_id, str):
+            raise ValueError("schedule entry id must be text")
+        try:
+            entry_id = uuid.UUID(raw_id)
+        except ValueError as exc:
+            raise ValueError("schedule entry id must be a valid UUID") from exc
+
+    start_minutes = parse_time_minutes(item.get("start_time"), "start_time")
+    end_minutes = parse_time_minutes(item.get("end_time"), "end_time")
+    if not 0 <= start_minutes < end_minutes <= 24 * 60:
+        raise ValueError("schedule entry end_time must be after start_time")
+
+    title = item.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError("schedule entry title is required")
+    title = title.strip()
+    if len(title) > MAX_SCHEDULE_TITLE_LENGTH:
+        raise ValueError("schedule entry title is too long")
+
+    note = item.get("note", "")
+    if not isinstance(note, str):
+        raise ValueError("schedule entry note must be text")
+
+    section_id = item.get("section_id")
+    if section_id in {None, ""}:
+        section_id = ""
+    elif not isinstance(section_id, str) or section_id not in SLOT_IDS:
+        raise ValueError("schedule entry section_id is invalid")
+
+    order = item.get("order", index)
+    if isinstance(order, bool) or not isinstance(order, int) or order < 0:
+        raise ValueError("schedule entry order must be a zero or positive number")
+
+    return {
+        "id": entry_id,
+        "start_minutes": start_minutes,
+        "end_minutes": end_minutes,
+        "title": title,
+        "note": note.strip(),
+        "section_id": section_id,
+        "order": order,
+    }
+
+
+def serialize_schedule_entry(entry: DayScheduleEntry) -> dict:
+    return {
+        "id": str(entry.id),
+        "start_time": format_minutes(entry.start_minutes),
+        "end_time": format_minutes(entry.end_minutes),
+        "title": entry.title,
+        "note": entry.note,
+        "section_id": entry.section_id or None,
+        "order": entry.order,
+    }
+
+
 def build_week(week_start: datetime.date) -> Week:
     week, _ = Week.objects.get_or_create(start_date=week_start)
     existing_by_date = {day.date: day for day in week.days.all()}
@@ -164,6 +247,10 @@ def serialize_day(day: DayPlan) -> dict:
         "weekday_index": day.weekday_index,
         "weekday_name": WEEKDAY_NAMES[day.weekday_index],
         "sections": sections,
+        "schedule_entries": [
+            serialize_schedule_entry(entry)
+            for entry in day.schedule_entries.all()
+        ],
     }
 
 
@@ -359,7 +446,9 @@ def week_summaries(request):
 
     weeks_by_start = {
         week.start_date: week
-        for week in Week.objects.filter(start_date__in=starts).prefetch_related("days")
+        for week in Week.objects.filter(start_date__in=starts).prefetch_related(
+            "days__schedule_entries"
+        )
     }
     summaries = []
     for start in starts:
@@ -400,18 +489,6 @@ def week_detail(request, start_date: str):
         except json.JSONDecodeError:
             return HttpResponseBadRequest("Invalid JSON payload")
 
-        weekly_goal = payload.get("weekly_goal")
-        weekly_note = payload.get("weekly_note")
-        week_changed = False
-        if isinstance(weekly_goal, str):
-            week.weekly_goal = weekly_goal.strip()
-            week_changed = True
-        if isinstance(weekly_note, str):
-            week.weekly_note = weekly_note.strip()
-            week_changed = True
-        if week_changed:
-            week.save(update_fields=["weekly_goal", "weekly_note", "updated_at"])
-
         days_payload = payload.get("days", [])
         if not isinstance(days_payload, list):
             return HttpResponseBadRequest("days must be an array")
@@ -419,45 +496,81 @@ def week_detail(request, start_date: str):
         days_by_date = {day.date.isoformat(): day for day in week.days.all()}
         changed_days = []
 
-        for item in days_payload:
-            if not isinstance(item, dict):
-                continue
-            day = days_by_date.get(item.get("date"))
-            if day is None:
-                continue
+        try:
+            with transaction.atomic():
+                weekly_goal = payload.get("weekly_goal")
+                weekly_note = payload.get("weekly_note")
+                week_changed = False
+                if isinstance(weekly_goal, str):
+                    week.weekly_goal = weekly_goal.strip()
+                    week_changed = True
+                if isinstance(weekly_note, str):
+                    week.weekly_note = weekly_note.strip()
+                    week_changed = True
+                if week_changed:
+                    week.save(update_fields=["weekly_goal", "weekly_note", "updated_at"])
 
-            sections = item.get("sections", {})
-            if not isinstance(sections, dict):
-                continue
+                for item in days_payload:
+                    if not isinstance(item, dict):
+                        continue
+                    day = days_by_date.get(item.get("date"))
+                    if day is None:
+                        continue
 
-            changed = False
-            for raw_section, section_payload in sections.items():
-                section = normalize_section_key(raw_section)
-                if section is None:
-                    continue
-                if not isinstance(section_payload, dict):
-                    continue
-                field_prefix = field_prefix_for_slot(section)
+                    sections = item.get("sections", {})
+                    if not isinstance(sections, dict):
+                        continue
 
-                duration = section_payload.get("duration_minutes")
-                goal = section_payload.get("goal")
-                note = section_payload.get("note")
+                    changed = False
+                    for raw_section, section_payload in sections.items():
+                        section = normalize_section_key(raw_section)
+                        if section is None:
+                            continue
+                        if not isinstance(section_payload, dict):
+                            continue
+                        field_prefix = field_prefix_for_slot(section)
 
-                if isinstance(duration, int) and duration >= 0:
-                    setattr(day, f"{field_prefix}_duration_minutes", duration)
-                    changed = True
-                if isinstance(goal, str):
-                    setattr(day, f"{field_prefix}_goal", goal.strip())
-                    changed = True
-                if isinstance(note, str):
-                    setattr(day, f"{field_prefix}_note", note.strip())
-                    changed = True
+                        duration = section_payload.get("duration_minutes")
+                        goal = section_payload.get("goal")
+                        note = section_payload.get("note")
 
-            if changed:
-                changed_days.append(day)
+                        if isinstance(duration, int) and duration >= 0:
+                            setattr(day, f"{field_prefix}_duration_minutes", duration)
+                            changed = True
+                        if isinstance(goal, str):
+                            setattr(day, f"{field_prefix}_goal", goal.strip())
+                            changed = True
+                        if isinstance(note, str):
+                            setattr(day, f"{field_prefix}_note", note.strip())
+                            changed = True
 
-        if changed_days:
-            DayPlan.objects.bulk_update(changed_days, SECTION_FIELD_NAMES)
+                    if changed:
+                        changed_days.append(day)
+
+                    if "schedule_entries" in item:
+                        entries_payload = item["schedule_entries"]
+                        if not isinstance(entries_payload, list):
+                            raise ValueError("schedule_entries must be an array")
+                        normalized_entries = [
+                            normalize_schedule_entry_payload(entry, index)
+                            for index, entry in enumerate(entries_payload)
+                        ]
+                        if len({entry["id"] for entry in normalized_entries}) != len(
+                            normalized_entries
+                        ):
+                            raise ValueError("schedule entry ids must be unique")
+                        day.schedule_entries.all().delete()
+                        DayScheduleEntry.objects.bulk_create(
+                            [
+                                DayScheduleEntry(day=day, **entry)
+                                for entry in normalized_entries
+                            ]
+                        )
+
+                if changed_days:
+                    DayPlan.objects.bulk_update(changed_days, SECTION_FIELD_NAMES)
+        except ValueError as exc:
+            return HttpResponseBadRequest(str(exc))
 
     week.refresh_from_db()
     return JsonResponse(serialize_week(week))
