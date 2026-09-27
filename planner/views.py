@@ -29,6 +29,7 @@ SECTION_FIELD_NAMES = [
     for field_prefix in SLOT_TO_FIELD_PREFIX.values()
     for field in ("duration_minutes", "goal", "note")
 ]
+DAY_PLAN_FIELD_NAMES = [*SECTION_FIELD_NAMES, "day_note"]
 DEFAULT_PLANNER_SECTIONS = tuple(
     {
         "slot_id": f"slot_{index}",
@@ -246,6 +247,7 @@ def serialize_day(day: DayPlan) -> dict:
         "date": day.date.isoformat(),
         "weekday_index": day.weekday_index,
         "weekday_name": WEEKDAY_NAMES[day.weekday_index],
+        "day_note": day.day_note,
         "sections": sections,
         "schedule_entries": [
             serialize_schedule_entry(entry)
@@ -522,6 +524,10 @@ def week_detail(request, start_date: str):
                         continue
 
                     changed = False
+                    day_note = item.get("day_note")
+                    if isinstance(day_note, str):
+                        day.day_note = day_note.strip()
+                        changed = True
                     for raw_section, section_payload in sections.items():
                         section = normalize_section_key(raw_section)
                         if section is None:
@@ -568,7 +574,7 @@ def week_detail(request, start_date: str):
                         )
 
                 if changed_days:
-                    DayPlan.objects.bulk_update(changed_days, SECTION_FIELD_NAMES)
+                    DayPlan.objects.bulk_update(changed_days, DAY_PLAN_FIELD_NAMES)
         except ValueError as exc:
             return HttpResponseBadRequest(str(exc))
 

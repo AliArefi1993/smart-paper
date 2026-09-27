@@ -21,6 +21,7 @@ class DayPlan(models.Model):
     week = models.ForeignKey(Week, on_delete=models.CASCADE, related_name="days")
     date = models.DateField(db_index=True)
     weekday_index = models.PositiveSmallIntegerField()
+    day_note = models.TextField(blank=True)
     main_duration_minutes = models.PositiveIntegerField(default=0)
     main_goal = models.TextField(blank=True)
     main_note = models.TextField(blank=True)

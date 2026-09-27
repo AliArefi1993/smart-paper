@@ -17,7 +17,7 @@ from finance.views import require_finance_unlock, serialize_finance
 
 from .models import DayPlan, DayScheduleEntry, PlannerSectionConfig, Week
 from .views import (
-    SECTION_FIELD_NAMES,
+    DAY_PLAN_FIELD_NAMES,
     SECTIONS,
     SLOT_IDS,
     WEEKDAY_NAMES,
@@ -110,6 +110,17 @@ def export_csv(payload: dict) -> str:
             }
         )
         for day in week["days"]:
+            if day.get("day_note"):
+                writer.writerow(
+                    {
+                        "record_type": "day_note",
+                        "week_start": week["start_date"],
+                        "week_end": week["end_date"],
+                        "date": day["date"],
+                        "weekday": WEEKDAY_NAMES[day["weekday_index"]],
+                        "note": day["day_note"],
+                    }
+                )
             for entry in day.get("schedule_entries", []):
                 writer.writerow(
                     {
@@ -217,6 +228,8 @@ def export_markdown(payload: dict) -> str:
 
         for day in week["days"]:
             day_lines = []
+            if day.get("day_note"):
+                day_lines.append(f"  - Day note: {day['day_note']}")
             for entry in day.get("schedule_entries", []):
                 section_label = section_labels.get(entry.get("section_id") or "", "")
                 suffix = f"; section: {section_label}" if section_label else ""
@@ -302,6 +315,8 @@ def export_xlsx(payload: dict) -> bytes:
             "Note",
         ]
     )
+    day_notes_sheet = workbook.create_sheet("Day Notes")
+    day_notes_sheet.append(["Week start", "Date", "Weekday", "Day note"])
     schedule_sheet = workbook.create_sheet("Schedule")
     schedule_sheet.append(
         [
@@ -329,6 +344,15 @@ def export_xlsx(payload: dict) -> bytes:
             ]
         )
         for day in week["days"]:
+            if day.get("day_note"):
+                day_notes_sheet.append(
+                    [
+                        week["start_date"],
+                        day["date"],
+                        day["weekday_name"],
+                        day["day_note"],
+                    ]
+                )
             for entry in day.get("schedule_entries", []):
                 section_id = entry.get("section_id") or ""
                 schedule_sheet.append(
@@ -403,6 +427,9 @@ def import_week(week_data: dict) -> bool:
         day = days_by_date.get(day_data.get("date"))
         if day is None:
             continue
+        day_note = day_data.get("day_note")
+        if isinstance(day_note, str):
+            day.day_note = day_note.strip()
         sections = day_data.get("sections", {})
         if not isinstance(sections, dict):
             continue
@@ -446,7 +473,7 @@ def import_week(week_data: dict) -> bool:
             )
 
     if changed_days:
-        DayPlan.objects.bulk_update(changed_days, SECTION_FIELD_NAMES)
+        DayPlan.objects.bulk_update(changed_days, DAY_PLAN_FIELD_NAMES)
 
     return True
 

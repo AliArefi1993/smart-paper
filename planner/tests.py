@@ -36,6 +36,7 @@ class PlannerApiTests(TestCase):
         self.assertTrue(payload["planner_sections"][0]["active"])
         self.assertFalse(payload["planner_sections"][-1]["active"])
         self.assertIn("slot_10", payload["days"][0]["sections"])
+        self.assertEqual(payload["days"][0]["day_note"], "")
         self.assertEqual(payload["days"][0]["schedule_entries"], [])
         self.assertEqual(Week.objects.count(), 1)
         self.assertEqual(DayPlan.objects.count(), 7)
@@ -93,6 +94,7 @@ class PlannerApiTests(TestCase):
             "days": [
                 {
                     "date": "2026-04-25",
+                    "day_note": "Start early and protect the afternoon.",
                     "sections": {
                         "main": {
                             "duration_minutes": 120,
@@ -132,6 +134,7 @@ class PlannerApiTests(TestCase):
             payload["weekly_note"], "Keep focus and avoid context switching"
         )
         self.assertEqual(payload["days"][0]["sections"]["slot_1"]["goal"], "Ship backend")
+        self.assertEqual(payload["days"][0]["day_note"], "Start early and protect the afternoon.")
         self.assertEqual(payload["totals"]["week_total_minutes"], 225)
         self.assertEqual(payload["totals"]["by_section_minutes"]["slot_1"], 120)
         self.assertEqual(payload["totals"]["by_section_minutes"]["slot_3"], 45)
@@ -498,6 +501,7 @@ class PlannerApiTests(TestCase):
                 "days": [
                     {
                         "date": "2026-04-25",
+                        "day_note": "Review the release checklist.",
                         "sections": {
                             "main": {
                                 "duration_minutes": 55,
@@ -532,10 +536,12 @@ class PlannerApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         workbook = load_workbook(io.BytesIO(response.content))
         self.assertEqual(
-            workbook.sheetnames, ["Overview", "Weeks", "Day Sections", "Schedule", "Income"]
+            workbook.sheetnames,
+            ["Overview", "Weeks", "Day Sections", "Day Notes", "Schedule", "Income"],
         )
         self.assertEqual(workbook["Weeks"]["C2"].value, "Readable Excel week")
         self.assertEqual(workbook["Day Sections"]["E2"].value, 55)
+        self.assertEqual(workbook["Day Notes"]["D2"].value, "Review the release checklist.")
         self.assertEqual(workbook["Income"]["C2"].value, "Excel income")
 
     def test_export_all_data_markdown_happy_path(self):
