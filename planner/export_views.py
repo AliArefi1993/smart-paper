@@ -25,6 +25,7 @@ from .views import (
     field_prefix_for_slot,
     normalize_schedule_entry_payload,
     normalize_section_key,
+    normalize_week_template_days,
     serialize_planner_sections,
     serialize_week_templates,
     serialize_week,
@@ -544,11 +545,16 @@ def import_week_templates(templates_data) -> int:
         weekly_note = item.get("weekly_note", "")
         if not isinstance(weekly_goal, str) or not isinstance(weekly_note, str):
             continue
+        try:
+            days = normalize_week_template_days(item.get("days"))
+        except ValueError:
+            continue
         WeekTemplate.objects.update_or_create(
             name=name,
             defaults={
                 "weekly_goal": weekly_goal.strip(),
                 "weekly_note": weekly_note.strip(),
+                "days": days,
             },
         )
         imported += 1

@@ -21,6 +21,7 @@ class WeekTemplate(models.Model):
     name = models.CharField(max_length=80, unique=True)
     weekly_goal = models.TextField(blank=True)
     weekly_note = models.TextField(blank=True)
+    days = models.JSONField(default=list)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

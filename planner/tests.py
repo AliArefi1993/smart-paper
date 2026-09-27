@@ -91,12 +91,36 @@ class PlannerApiTests(TestCase):
                 "name": "Focused week",
                 "weekly_goal": "Finish the important work",
                 "weekly_note": "Keep meetings short",
+                "days": [
+                    {
+                        "weekday_index": 0,
+                        "day_note": "Start with planning",
+                        "sections": {
+                            "slot_1": {
+                                "duration_minutes": 90,
+                                "goal": "Deep work",
+                                "note": "No interruptions",
+                            }
+                        },
+                        "schedule_entries": [
+                            {
+                                "start_time": "09:00",
+                                "end_time": "10:00",
+                                "title": "Planning block",
+                                "note": "Review priorities",
+                                "section_id": "slot_1",
+                            }
+                        ],
+                    }
+                ],
             },
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 200)
         template = response.json()["week_templates"][0]
         self.assertEqual(template["weekly_goal"], "Finish the important work")
+        self.assertEqual(template["days"][0]["sections"]["slot_1"]["duration_minutes"], 90)
+        self.assertEqual(template["days"][0]["schedule_entries"][0]["title"], "Planning block")
 
         response = self.client.post(
             reverse("week-templates"),

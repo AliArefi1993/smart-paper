@@ -119,11 +119,86 @@ def serialize_week_template(template: WeekTemplate) -> dict:
         "name": template.name,
         "weekly_goal": template.weekly_goal,
         "weekly_note": template.weekly_note,
+        "days": template.days,
     }
 
 
 def serialize_week_templates() -> list[dict]:
     return [serialize_week_template(template) for template in WeekTemplate.objects.all()]
+
+
+def normalize_week_template_days(days_data) -> list[dict]:
+    if days_data is None:
+        return []
+    if not isinstance(days_data, list):
+        raise ValueError("template days must be an array")
+
+    days_by_index = {}
+    for raw_day in days_data:
+        if not isinstance(raw_day, dict):
+            raise ValueError("template days must contain objects")
+        weekday_index = raw_day.get("weekday_index")
+        if (
+            isinstance(weekday_index, bool)
+            or not isinstance(weekday_index, int)
+            or not 0 <= weekday_index < len(WEEKDAY_NAMES)
+        ):
+            raise ValueError("template weekday_index is invalid")
+        if weekday_index in days_by_index:
+            raise ValueError("template weekday_index values must be unique")
+
+        day_note = raw_day.get("day_note", "")
+        if not isinstance(day_note, str):
+            raise ValueError("template day note must be text")
+        sections = raw_day.get("sections", {})
+        if not isinstance(sections, dict):
+            raise ValueError("template sections must be an object")
+        normalized_sections = {}
+        for raw_section, raw_data in sections.items():
+            section = normalize_section_key(raw_section)
+            if section is None or not isinstance(raw_data, dict):
+                continue
+            goal = raw_data.get("goal", "")
+            note = raw_data.get("note", "")
+            duration_minutes = raw_data.get("duration_minutes", 0)
+            if (
+                not isinstance(goal, str)
+                or not isinstance(note, str)
+                or isinstance(duration_minutes, bool)
+                or not isinstance(duration_minutes, int)
+                or duration_minutes < 0
+            ):
+                raise ValueError("template section data is invalid")
+            normalized_sections[section] = {
+                "duration_minutes": duration_minutes,
+                "goal": goal.strip(),
+                "note": note.strip(),
+            }
+
+        entries = raw_day.get("schedule_entries", [])
+        if not isinstance(entries, list):
+            raise ValueError("template schedule_entries must be an array")
+        normalized_entries = []
+        for index, raw_entry in enumerate(entries):
+            entry = normalize_schedule_entry_payload(raw_entry, index)
+            normalized_entries.append(
+                {
+                    "start_time": format_minutes(entry["start_minutes"]),
+                    "end_time": format_minutes(entry["end_minutes"]),
+                    "title": entry["title"],
+                    "note": entry["note"],
+                    "section_id": entry["section_id"] or None,
+                }
+            )
+
+        days_by_index[weekday_index] = {
+            "weekday_index": weekday_index,
+            "day_note": day_note.strip(),
+            "sections": normalized_sections,
+            "schedule_entries": normalized_entries,
+        }
+
+    return [days_by_index[index] for index in sorted(days_by_index)]
 
 
 def active_slot_ids(planner_sections: list[dict] | None = None) -> tuple[str, ...]:
@@ -438,11 +513,17 @@ def week_templates(request):
     if not isinstance(weekly_goal, str) or not isinstance(weekly_note, str):
         return HttpResponseBadRequest("template goal and note must be text")
 
+    try:
+        template_days = normalize_week_template_days(payload.get("days"))
+    except ValueError as exc:
+        return HttpResponseBadRequest(str(exc))
+
     WeekTemplate.objects.update_or_create(
         name=name,
         defaults={
             "weekly_goal": weekly_goal.strip(),
             "weekly_note": weekly_note.strip(),
+            "days": template_days,
         },
     )
     return JsonResponse({"week_templates": serialize_week_templates()})
