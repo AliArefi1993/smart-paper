@@ -84,6 +84,41 @@ class PlannerApiTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertTrue(PlannerSectionConfig.objects.get(slot_id="slot_1").active)
 
+    def test_week_templates_can_be_saved_updated_and_deleted(self):
+        response = self.client.post(
+            reverse("week-templates"),
+            data={
+                "name": "Focused week",
+                "weekly_goal": "Finish the important work",
+                "weekly_note": "Keep meetings short",
+            },
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        template = response.json()["week_templates"][0]
+        self.assertEqual(template["weekly_goal"], "Finish the important work")
+
+        response = self.client.post(
+            reverse("week-templates"),
+            data={
+                "name": "Focused week",
+                "weekly_goal": "Ship the release",
+                "weekly_note": "",
+            },
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["week_templates"]), 1)
+        self.assertEqual(response.json()["week_templates"][0]["weekly_goal"], "Ship the release")
+
+        response = self.client.delete(
+            reverse("week-templates"),
+            data={"id": template["id"]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["week_templates"], [])
+
     def test_week_update_happy_path(self):
         week_start = "2026-04-25"
         self.client.get(reverse("week-detail", args=[week_start]))
@@ -397,8 +432,9 @@ class PlannerApiTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["schema_version"], 3)
+        self.assertEqual(payload["schema_version"], 4)
         self.assertIn("planner_sections", payload)
+        self.assertIn("week_templates", payload)
         self.assertIn("exported_at", payload)
         self.assertEqual(payload["weeks"][0]["weekly_goal"], "Exportable week")
         self.assertEqual(payload["weeks"][0]["totals"]["week_total_minutes"], 90)

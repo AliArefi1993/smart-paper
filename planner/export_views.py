@@ -15,7 +15,7 @@ from openpyxl.utils import get_column_letter
 from finance.models import FinanceState, IncomeEntry
 from finance.views import require_finance_unlock, serialize_finance
 
-from .models import DayPlan, DayScheduleEntry, PlannerSectionConfig, Week
+from .models import DayPlan, DayScheduleEntry, PlannerSectionConfig, Week, WeekTemplate
 from .views import (
     DAY_PLAN_FIELD_NAMES,
     SECTIONS,
@@ -26,10 +26,11 @@ from .views import (
     normalize_schedule_entry_payload,
     normalize_section_key,
     serialize_planner_sections,
+    serialize_week_templates,
     serialize_week,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 EXPORT_COLUMNS = [
@@ -66,6 +67,7 @@ def export_payload() -> dict:
         "schema_version": SCHEMA_VERSION,
         "exported_at": datetime.datetime.now(datetime.UTC).isoformat(),
         "planner_sections": planner_sections,
+        "week_templates": serialize_week_templates(),
         "weeks": weeks,
         "finance": serialize_finance(),
     }
@@ -524,6 +526,36 @@ def import_planner_sections(sections_data) -> int:
     return len(changed)
 
 
+def import_week_templates(templates_data) -> int:
+    if not isinstance(templates_data, list):
+        return 0
+
+    imported = 0
+    for item in templates_data:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        name = name.strip()
+        if len(name) > 80:
+            continue
+        weekly_goal = item.get("weekly_goal", "")
+        weekly_note = item.get("weekly_note", "")
+        if not isinstance(weekly_goal, str) or not isinstance(weekly_note, str):
+            continue
+        WeekTemplate.objects.update_or_create(
+            name=name,
+            defaults={
+                "weekly_goal": weekly_goal.strip(),
+                "weekly_note": weekly_note.strip(),
+            },
+        )
+        imported += 1
+
+    return imported
+
+
 def import_finance(finance_data: dict) -> tuple[bool, int]:
     state, _ = FinanceState.objects.get_or_create(id=1)
     goal_amount = finance_data.get("goal_amount")
@@ -571,6 +603,7 @@ def import_payload(payload: dict, mode: str) -> dict:
             DayPlan.objects.all().delete()
             Week.objects.all().delete()
             PlannerSectionConfig.objects.all().delete()
+            WeekTemplate.objects.all().delete()
             IncomeEntry.objects.all().delete()
             FinanceState.objects.all().delete()
 
@@ -578,6 +611,7 @@ def import_payload(payload: dict, mode: str) -> dict:
         planner_sections_imported = import_planner_sections(
             payload.get("planner_sections")
         )
+        week_templates_imported = import_week_templates(payload.get("week_templates"))
 
         imported_weeks = 0
         for week_data in payload["weeks"]:
@@ -592,6 +626,7 @@ def import_payload(payload: dict, mode: str) -> dict:
         "mode": mode,
         "weeks_imported": imported_weeks,
         "planner_sections_imported": planner_sections_imported,
+        "week_templates_imported": week_templates_imported,
         "income_entries_imported": imported_entries,
         "finance_goal_updated": updated_goal,
         "payload": export_payload(),

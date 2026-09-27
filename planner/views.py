@@ -8,7 +8,7 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
-from .models import DayPlan, DayScheduleEntry, PlannerSectionConfig, Week
+from .models import DayPlan, DayScheduleEntry, PlannerSectionConfig, Week, WeekTemplate
 
 SLOT_IDS = tuple(f"slot_{index}" for index in range(1, 11))
 LEGACY_SECTION_TO_SLOT = {
@@ -66,6 +66,7 @@ WEEKDAY_NAMES = (
 )
 SATURDAY_WEEKDAY = 5
 MAX_SCHEDULE_TITLE_LENGTH = 160
+MAX_TEMPLATE_NAME_LENGTH = 80
 
 
 def normalize_section_key(section_key: str) -> str | None:
@@ -110,6 +111,19 @@ def serialize_planner_sections() -> list[dict]:
         for slot_id in SLOT_IDS
         if slot_id in sections_by_slot
     ]
+
+
+def serialize_week_template(template: WeekTemplate) -> dict:
+    return {
+        "id": template.id,
+        "name": template.name,
+        "weekly_goal": template.weekly_goal,
+        "weekly_note": template.weekly_note,
+    }
+
+
+def serialize_week_templates() -> list[dict]:
+    return [serialize_week_template(template) for template in WeekTemplate.objects.all()]
 
 
 def active_slot_ids(planner_sections: list[dict] | None = None) -> tuple[str, ...]:
@@ -392,6 +406,46 @@ def planner_sections(request):
         PlannerSectionConfig.objects.bulk_update(changed, ["label", "active", "updated_at"])
 
     return JsonResponse({"planner_sections": serialize_planner_sections()})
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST", "DELETE"])
+def week_templates(request):
+    if request.method == "GET":
+        return JsonResponse({"week_templates": serialize_week_templates()})
+
+    try:
+        payload = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return HttpResponseBadRequest("Invalid JSON payload")
+
+    if request.method == "DELETE":
+        template_id = payload.get("id")
+        if not isinstance(template_id, int):
+            return HttpResponseBadRequest("template id must be a number")
+        WeekTemplate.objects.filter(id=template_id).delete()
+        return JsonResponse({"week_templates": serialize_week_templates()})
+
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return HttpResponseBadRequest("template name is required")
+    name = name.strip()
+    if len(name) > MAX_TEMPLATE_NAME_LENGTH:
+        return HttpResponseBadRequest("template name is too long")
+
+    weekly_goal = payload.get("weekly_goal", "")
+    weekly_note = payload.get("weekly_note", "")
+    if not isinstance(weekly_goal, str) or not isinstance(weekly_note, str):
+        return HttpResponseBadRequest("template goal and note must be text")
+
+    WeekTemplate.objects.update_or_create(
+        name=name,
+        defaults={
+            "weekly_goal": weekly_goal.strip(),
+            "weekly_note": weekly_note.strip(),
+        },
+    )
+    return JsonResponse({"week_templates": serialize_week_templates()})
 
 
 @require_http_methods(["GET"])
